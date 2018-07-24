@@ -1,4 +1,3 @@
-# from __future__ import absolute_import
 import os
 import matplotlib as plt
 import II # Rename API as II
@@ -12,6 +11,12 @@ from shapely.geometry import Polygon, Point
 from math import asin, cos, pi, sin, radians, sqrt, atan2
 from extract_trajectory import extract_coordinate, extract_speed
 from extract_name import is_intersection
+import logging
+import csv
+import shutil
+
+logger = logging.getLogger()
+logging.basicConfig(format='%(asctime)s- %(funcName)s %(message)s', level=logging.INFO)
 
 def deg2rad(angle):
     return angle * pi / 180
@@ -77,7 +82,7 @@ def find_area_intersections(coordinate, speed = 15):
     [<overpy.Node id=42800986 lat=40.7681152 lon=-73.9038760>,
      <overpy.Node id=42865836 lat=40.7689047 lon=-73.9069026>]
     """
-    radius = 0.2
+    radius = 0.3
     ## If use speed to define radius, uncomment the following two lines
     # acc = 5 # m/s^2
     # radius = max(0.2, (speed * 1.60934) ** 2 / (2 * 1000 * acc)) # in km
@@ -229,5 +234,113 @@ def main():
             print ('Save the conflict zone fig.')
             cz_next.savefig(dir_saved + str(os.path.splitext(f)[0]) + '_' + str(i + 1) + '.png')
 
-if __name__ == "__main__":
-    main()
+# def analyze_SF():
+"""
+Identify signalized intersections in San Francisco, for which we have video feed and GPS traces in BDD 100k.
+Sort them in the descending order by number of traces per intersection.
+Extract traces for these intersections in the form of a Python dictionary of the following form: {(street 1, street 2): <list of traces>}, where the tuple (street1, street 2) identifies the intersection, and each trace in the list contains a name of the video file in addition to the sequence of (lon, lat) coordinates.
+"""
+dir_used = '/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/Val_data/'
+dir_val = '/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/Val_usedData/'
+inx_count_dict = {}
+inx_traj_dict = {}
+inx_file_dict = {}
+for f in listdir(dir_val): # total  2500 files
+
+    # Read the file
+    logger.info("Now is the file %s." % f)
+    if f.startswith('.'):
+        continue
+    with open(dir_val + str(os.path.splitext(f)[0]) + '.json') as json_data:
+        data_curr = json.load(json_data) # .json file
+
+    # Get the coordinates and speeds, deal with edge case
+    route_coor = extract_coordinate(data_curr)
+    route_speed = extract_speed(data_curr)
+    shutil.move(dir_val + str(f), dir_used + str(f))
+    # If the video duration is shorter than 5 seconds, jump to next file.
+    if len(route_coor) <= 5:
+        logger.warning("There is no effective trajectory in the file %s." %f)
+        continue
+    assert len(route_coor) == len(route_speed), "Missing attributes in " + f
+    # If the trajectory is not around SF, give a warning and jump to next file
+    bound_left = [-123.0137, 37.6040]
+    bound_right = [-122.3549, 37.8324]
+    if route_coor[0][0] < 37.6040 or route_coor[0][1] > 37.8324 \
+        or route_coor[0][1] > -122.3549 or route_coor[0][1] < -123.0137:
+        logger.warning("This trajectory is not in SF. Jump to next file.")
+        continue
+
+    # For each data point (1s), check its next intersection along the route;
+    none_count = 0
+    inx_name_set = []
+    for i in range(0, len(route_coor) - 1, 2):
+        logger.debug("For location %d." % (i + 1))
+        coor_curr = route_coor[i]
+        speed_curr = route_speed[i]
+        coor_next = route_coor[i + 1]
+
+
+        # Find intersections near current location
+        inx_area = find_area_intersections(coor_curr, speed_curr)
+        if inx_area is None:
+            none_count += 1
+            continue
+        logger.debug("There are %d intersections near here." % len(inx_area))
+
+        # Find next intersection based on some rules
+        inx_next_coor = find_next_intersection(coor_curr, coor_next, inx_area)
+
+        # If it is too far away, will return None; o/w, find inx name.
+        if inx_next_coor is None:
+            none_count += 1
+            logger.debug("Next intersection is not in scope!")
+            continue
+        inx_next_name = is_intersection(inx_next_coor) #[street1, street2, city, state]
+        logger.debug("The next intersection is %s." % inx_next_name)
+
+        # Store the intersection names along the route (easily duplicate) if in SF; \
+        # o/w, jump to next file
+        if inx_next_name[2] != "San Francisco":
+            logger.warning("This trajectory is not in SF. Jump to next file.")
+            break
+        inx_name_set.append(inx_next_name)
+
+    # If the route is not in SF, jump to next file
+    if i < range(0, len(route_coor) - 1, 2)[-1]:
+        continue
+
+    # If the route is too far away, will return None and give warning.
+    if none_count == len(range(0, len(route_coor) - 1, 2)):
+        logger.warning("The trajectory in file %s is far away from intersections" %f)
+        continue
+
+    # Find the unique intersection names along this route
+    inx_name_set = [(x[0], x[1]) for x in set(tuple(x) for x in inx_name_set)]
+    for inx_name in inx_name_set:
+        if inx_name not in inx_count_dict:
+            inx_count_dict[inx_name] = 1
+            inx_traj_dict[inx_name] = [route_coor]
+            inx_file_dict[inx_name] = [f]
+
+        else:
+            inx_count_dict[inx_name] += 1
+            inx_traj_dict[inx_name].append(route_coor)
+            inx_file_dict[inx_name].append(f)
+
+with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_count_1.csv', 'w') as csv_file:
+    writer = csv.writer(csv_file)
+    for key, value in inx_count_dict.items():
+       writer.writerow([key, value])
+with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_traj_1.csv', 'w') as csv_file:
+    writer = csv.writer(csv_file)
+    for key, value in inx_traj_dict.items():
+       writer.writerow([key, value])
+with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_file_1.csv', 'w') as csv_file:
+    writer = csv.writer(csv_file)
+    for key, value in inx_file_dict.items():
+       writer.writerow([key, value])
+
+
+# if __name__ == "__main__":
+#     main()
