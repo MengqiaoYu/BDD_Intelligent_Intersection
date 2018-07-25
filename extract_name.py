@@ -113,9 +113,10 @@ def is_intersection(coordinate):
                 # We don't consider this location if the two street names are same
                 if len(cityName) != 0:
                     # We use county name instead of city name if the field of city name is null.
-                    return [street1, street2, cityName, stateName]
+                    return sorted([street1, street2]) + [cityName, stateName]
+                    # Sort street 1 and street 1 alphabetically to avoid swapped name
                 else:
-                    return [street1, street2, countyName, stateName]
+                    return sorted([street1, street2]) + [countyName, stateName]
         except Exception:
             # If there are some other issues, return None
             return None
@@ -167,3 +168,6 @@ def main():
             for f in file_used_all:
                 shutil.move(dir_val + str(f), dir_used + str(f))
             file_used_all = []
+
+if __name__ == '__main__':
+    main()
