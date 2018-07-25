@@ -14,9 +14,7 @@ from extract_name import is_intersection
 import logging
 import csv
 import shutil
-
-logger = logging.getLogger()
-logging.basicConfig(format='%(asctime)s- %(funcName)s %(message)s', level=logging.INFO)
+from collections import defaultdict
 
 def deg2rad(angle):
     return angle * pi / 180
@@ -72,7 +70,7 @@ def haversine(lon1, lat1, lon2, lat2):
     c = 2 * asin(sqrt(a))
 
     dis = rEarth * c
-    return dis
+    return dis # in km
 
 def find_area_intersections(coordinate, speed = 15):
     """
@@ -82,7 +80,7 @@ def find_area_intersections(coordinate, speed = 15):
     [<overpy.Node id=42800986 lat=40.7681152 lon=-73.9038760>,
      <overpy.Node id=42865836 lat=40.7689047 lon=-73.9069026>]
     """
-    radius = 0.3
+    radius = 0.25
     ## If use speed to define radius, uncomment the following two lines
     # acc = 5 # m/s^2
     # radius = max(0.2, (speed * 1.60934) ** 2 / (2 * 1000 * acc)) # in km
@@ -111,6 +109,8 @@ def find_next_intersection(coor_curr, coor_next, coor_intersections):
     """
     find next intersection along the trajectory based on current loc and 1 sec later.
     return the intersection (lat, lon)
+    return -1, if the vehicle stops
+    return none if cannot find next intersection in current scope
     """
     # setup your projections
     crs_wgs = proj.Proj(init='epsg:3857') # assuming you're using WGS84 geographic
@@ -120,21 +120,27 @@ def find_next_intersection(coor_curr, coor_next, coor_intersections):
     x_curr, y_curr = proj.transform(crs_wgs, crs_bng, coor_curr[1], coor_curr[0])
     x_next, y_next = proj.transform(crs_wgs, crs_bng, coor_next[1], coor_next[0])
 
-    angle_max = 90
-    # none_count = 0
+    # Stopping/waiting --> unstable GPS
+    if haversine(coor_curr[1], coor_curr[0], coor_next[1], coor_next[0]) <= 0.0009:
+        # 2mph
+        return -1
+
+    # Find next intersection based on distance and angle
+    angle_max = 60
+    dist_max = 1
     for item in coor_intersections:
         inx_lat, inx_lon = float(item.lat), float(item.lon)
         x_inx, y_inx = proj.transform(crs_wgs, crs_bng, inx_lon, inx_lat)
         v_1 = np.array([x_next - x_curr, y_next - y_curr])
         v_2 = np.array([x_inx - x_curr, y_inx - y_curr])
         dis2inx = haversine(coor_curr[1], coor_curr[0], inx_lon, inx_lat)
-        if dis2inx <= 0.02:
+        if dis2inx <= 0.03:
             return (inx_lat, inx_lon)
-        if angle_2vector(v_1, v_2) < angle_max:
-            angle_max = angle_2vector(v_1, v_2)
+        if angle_2vector(v_1, v_2) < angle_max and dis2inx < dist_max:
+            dist_max = dis2inx
             target_inx = (inx_lat, inx_lon)
             continue
-    if angle_max == 90:
+    if dist_max == 1:
         return None
     return target_inx
 
@@ -240,27 +246,29 @@ Identify signalized intersections in San Francisco, for which we have video feed
 Sort them in the descending order by number of traces per intersection.
 Extract traces for these intersections in the form of a Python dictionary of the following form: {(street 1, street 2): <list of traces>}, where the tuple (street1, street 2) identifies the intersection, and each trace in the list contains a name of the video file in addition to the sequence of (lon, lat) coordinates.
 """
-dir_used = '/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/Val_data/'
-dir_val = '/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/Val_usedData/'
+dir_val = '/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/Val_data/'
+dir_used = '/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/Val_usedData/'
 inx_count_dict = {}
 inx_traj_dict = {}
 inx_file_dict = {}
+logger = logging.getLogger()
+logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
 for f in listdir(dir_val): # total  2500 files
 
-    # Read the file
-    logger.info("Now is the file %s." % f)
+    ### Read the file
     if f.startswith('.'):
         continue
     with open(dir_val + str(os.path.splitext(f)[0]) + '.json') as json_data:
         data_curr = json.load(json_data) # .json file
+    logger.info("Now is the file %s." % f)
 
-    # Get the coordinates and speeds, deal with edge case
+    ### Get the coordinates and speeds, deal with edge case
     route_coor = extract_coordinate(data_curr)
     route_speed = extract_speed(data_curr)
     shutil.move(dir_val + str(f), dir_used + str(f))
     # If the video duration is shorter than 5 seconds, jump to next file.
     if len(route_coor) <= 5:
-        logger.warning("There is no effective trajectory in the file %s." %f)
+        logger.info("There is no effective trajectory in the file %s." %f)
         continue
     assert len(route_coor) == len(route_speed), "Missing attributes in " + f
     # If the trajectory is not around SF, give a warning and jump to next file
@@ -268,15 +276,18 @@ for f in listdir(dir_val): # total  2500 files
     bound_right = [-122.3549, 37.8324]
     if route_coor[0][0] < 37.6040 or route_coor[0][1] > 37.8324 \
         or route_coor[0][1] > -122.3549 or route_coor[0][1] < -123.0137:
-        logger.warning("This trajectory is not in SF. Jump to next file.")
+        logger.info("This trajectory is not in SF.")
         continue
 
-    # For each data point (1s), check its next intersection along the route;
+    ### For each data point (1s), check its next intersection along the route;
     none_count = 0
+    stopping_count = 0
     inx_name_set = []
     for i in range(0, len(route_coor) - 1, 2):
         logger.debug("For location %d." % (i + 1))
+
         coor_curr = route_coor[i]
+        logger.debug(coor_curr)
         speed_curr = route_speed[i]
         coor_next = route_coor[i + 1]
 
@@ -290,19 +301,25 @@ for f in listdir(dir_val): # total  2500 files
 
         # Find next intersection based on some rules
         inx_next_coor = find_next_intersection(coor_curr, coor_next, inx_area)
-
         # If it is too far away, will return None; o/w, find inx name.
         if inx_next_coor is None:
             none_count += 1
             logger.debug("Next intersection is not in scope!")
             continue
+        if inx_next_coor == -1:
+            stopping_count += 1
+            continue
         inx_next_name = is_intersection(inx_next_coor) #[street1, street2, city, state]
+        if inx_next_name is None:
+            none_count += 1
+            logger.debug("Next intersection doesn't have a name!")
+            continue
         logger.debug("The next intersection is %s." % inx_next_name)
 
         # Store the intersection names along the route (easily duplicate) if in SF; \
         # o/w, jump to next file
         if inx_next_name[2] != "San Francisco":
-            logger.warning("This trajectory is not in SF. Jump to next file.")
+            logger.info("This trajectory is not in SF.")
             break
         inx_name_set.append(inx_next_name)
 
@@ -312,10 +329,13 @@ for f in listdir(dir_val): # total  2500 files
 
     # If the route is too far away, will return None and give warning.
     if none_count == len(range(0, len(route_coor) - 1, 2)):
-        logger.warning("The trajectory in file %s is far away from intersections" %f)
+        logger.info("The trajectory in file %s is far away from intersections" %f)
+        continue
+    if stopping_count == len(range(0, len(route_coor) - 1, 2)):
+        logger.info("The trajectory in file %s is stopping." %f)
         continue
 
-    # Find the unique intersection names along this route
+    ## Find the unique intersection names along this route
     inx_name_set = [(x[0], x[1]) for x in set(tuple(x) for x in inx_name_set)]
     for inx_name in inx_name_set:
         if inx_name not in inx_count_dict:
@@ -328,15 +348,15 @@ for f in listdir(dir_val): # total  2500 files
             inx_traj_dict[inx_name].append(route_coor)
             inx_file_dict[inx_name].append(f)
 
-with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_count_1.csv', 'w') as csv_file:
+with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_count_3.csv', 'w') as csv_file:
     writer = csv.writer(csv_file)
     for key, value in inx_count_dict.items():
        writer.writerow([key, value])
-with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_traj_1.csv', 'w') as csv_file:
+with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_traj_3.csv', 'w') as csv_file:
     writer = csv.writer(csv_file)
     for key, value in inx_traj_dict.items():
        writer.writerow([key, value])
-with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_file_1.csv', 'w') as csv_file:
+with open('/Users/MengqiaoYu/Desktop/BDD currently/VideoData_ForAlex/dict_file_3.csv', 'w') as csv_file:
     writer = csv.writer(csv_file)
     for key, value in inx_file_dict.items():
        writer.writerow([key, value])
